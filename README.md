@@ -1,2 +1,4 @@
 # FlightDev
-Code that will allow you to use a FDRM-MCXA156 devboard as a flightcontroller
+Code that will allow you to use any devboard as a flight controller.
+
+Includes a build for an airplane and fpv drone combo.
