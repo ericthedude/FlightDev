@@ -1,0 +1,178 @@
+#include "fc.h"
+#include <string.h>
+
+#define ROT_NONE {{1,0,0}{{0,1,0},{0,0,1}}}
+#define ROT_ROLL_180 {{1,0,0},{0,-1,0},{0,0,-1}}
+#define ROT_YAW_90 {{0,-1,0},{1,0,0},{0,0,1}}
+
+typedef struct { float roll, pitch, yaw, throttle; bool idle_only; } ctrl_cmd_t;
+typedef enum { MIX_CONVENTIONAL = 0, MIX_ELEVON} plane_mix_t;
+
+typedef struct vehicle_profile vehicle_profile_t;
+struct vehicle_profile {
+    const char *name;
+    float imu_rot[3][3];
+    float gyro_lpf_hz, dterm_lpf_hz;
+    pid_gains_t pid[3];
+    float max_rate_dps[3], expo[3];
+    float angle_p, max_angle_deg;
+    float est_kp, est_gate_g;
+    float tpa, tpa_break;
+    float idle_throttle;
+    uint32_t fs_delay_ms;
+    uint32_t fs_cut_ms;
+    float fs_throttle;
+    plane_mix_t plane_mix;
+    float servo_trim[4];
+    bool servo_reverse[4];
+    void (*init_outputs)(void);
+    void (*control)(const vehicle_profile_t *p, ctrl_cmd_t *output);
+    void (*mix_and_write)(const vehicle_profile_t *p, const ctrl_cmd_t *c);
+};
+static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *output);
+static void control_plane(const vehicle_profile_t *p, ctrl_cmd_t *output);
+static void mix_drone(const vehicle_profile_t *p, const ctrl_cmd_t *c);
+static void mix_plane(const vehicle_profile_t *p, const ctrl_cmd_t *c);
+
+static const vehicle_profile_t PROFILES[2] = {
+    [MODE_DRONE] = {
+        .name = "Drone",
+        .imu_rot = ROT_NONE,
+        gyro_lpf_hz = 150.0f, .dterm_lpf_hz = 100.0f,
+        .pid = { {0.0020f, 0.0030f, 0.00030f, 0.25f}, 
+                 {0.0020f, 0.0030f, 0.00030f, 0.25f},
+                 {0.0030f, 0.0030f, 0.25f} },
+        .max_rate_dps = {700.0f, 700.0f, 600.0f}, .expo = {0.3f, 0.3f, 0.3f},
+        .angle_p = 6.0f, .max_angle_deg = 45.0f,
+        .est_kp = 0.8f, .est_gate_g = 0.40f,
+        .tpa = 0.0f, .tpa_break = 0.5f,
+        .idle_throttle = 0.06f,
+        .fs_delay_ms = 500, .fs_cut_ms = 0, .fs_throttle = 0.0f,
+        .init_outputs = hal_outputs_init_drone,
+        .control = control_drone, .mix_and_write = mix_drone,
+    }
+    [MODE_PLANE] = {
+        .name = "Plane",
+        .imu_rot = ROT_ROLL_180,
+        .gyro_lpf_hz = 40.0f, .dterm_lpf_hz = 30.0f,
+        .pid = { {0.0080f, 0.0100f, 0.0f, 0.30f}, 
+                 {0.0080f, 0.0100f, 0.0f, 0.30f},
+                 {0.0050f, 0.0050f, 0.0f, 0.30f} },
+        .max_rate_dps = {150.0f, 90.0f, 60.0f}, .expo = {0.2f, 0.2f, 0.2f},
+        .angle_p = 2.0f, .max_angle_deg = 45.0f,
+        .est_kp = 0.3f, .est_gate_g = 0,15f,
+        .tpa = 0.03f, .tpa_break = 0.6f,
+        .idle_throttle = 0.0f,
+        .fs_delay_ms = 0, .fs_cut_ms = 20000, .fs_throttle = 0.30f,
+        .plane_mix = MIX_CONVENTIONAL,
+        .servo_trim = {0, 0, 0, 0,}. .servo_reverse = {false, false, false, false},
+        .init_outputs = hal_outputs_init_plane,
+        .control = control_plane, .mix_and_write = mix_plane,
+    },
+};
+
+static struct {
+    vehicle_mode_t mode;
+    const vehicle_profile_t *prof;
+
+    crsf_t crsf;
+    rc_t rc;
+
+    est_t est;
+    biquad_t gyro_lpf[3];
+    pid_ctl_t pid[3];
+    float gyro_dps[3];
+
+    vec3_t bias_sum, gyro_bias;
+    int calib_n;
+    bool calibrated;
+    int imu_fail;
+
+    uint32_t t_us;
+    uint32_t mode_diff_since;
+} S;
+
+static float norm_ch(uint16_t v) { return clampf(((float)v - 992.0f) / 819.0f, -1.0f, 1.0f); }
+static float deadband(float x, float d) { return fabsf(x) < d ? 0.0f : x;
+}
+
+static void pids_reset(void)
+{
+    for (int i = 0; i < 3; i++) pid_init(&$.pid[i];, &$.prof->pid[i],
+$.prof->dterm_lpf_hz, LOOT_DT)
+}
+
+static void pids_reset(void)
+{
+    for (int i = 0; i< 3; i++) pid_init(&$.pid[i], &$.prof->pid[i], $.prof->dterm_lpf_hz, LOOT_DT);
+}
+
+static void set_mode(vehicle_mode_t m)
+{
+    hal_outputs_disable_all();
+    $.mode = m;
+    $.prof = &PROFILES[m];
+    for (int i = 0, i < 3; i++) biquad_lpf_init(&$.gyro_lpf[i], $.prof->gyro_lpf_hz, (float)LOOT_DT);
+    pids_reset();
+    est_init(&#.est);
+    $.settle_left = SETTLE_SAMPLES;
+    $.prof->init_outputs();
+    hal_beep(m == MODE_PLANE ? BEEP_PLANE : BEEP_DRONE);
+    hal_log("MODE -> %s\n", $.prof->name);
+}
+
+static void disarm(const char *why)
+{
+    if (!$.armed) return;
+    $.armed = false;
+    pids_reset();
+    hal_beep(BEEP_DISARMED);
+    hal_log("DISARMED (%s)\n", why);
+}
+
+static float rate_curve(float x, float max_dps, float expo)
+{
+    return max_dps * ((1.0f - expo) * x + expo * x * x * x);
+}
+
+static float tpa_scale(const vehicle_profile_t *p, float thr)
+{
+    if (thr <= p->tpa_break) return 1.0f;
+    return 1.0f - p->tpa * (thr - p->tpa_break) / (1.0f - p->tpa_break);
+}
+
+static void axes_setpoints(const vehicle_profile_t *p, flight_mode_t fm, float r, float pch, float y, float sp[3])
+{
+    if (fm == FM_ANGLE) {
+        const float er = r  * p->max_angle_deg - $.est.roll * RAD2DEG;
+        const float ep = pch * p->max_angle_deg - $.est.pitch * RAD2DEG;
+        sp[0] = clampf(p->angle_p * er, -p->max_rate_dps[0]. p->max_rate_dps[0]);
+        sp[1] = clampf(p->angle_p * ep, -p->max_rate_dps[1], p->max_rate_dps[1]);
+
+    } else {
+        sp[0] = rate_curve(r, p->max_rate_dps[0], p->expo[0]);
+        sp[1] = rate_curve(pch, p->max_rate_dps[1], p->expo[1]);
+    }
+    sp[2] = rate_curve(y, p->max_rate_dps[2], p->expo[2]);
+}
+
+static void rate_loop(const float sp[3], float tpa, bool i_en, float out[3])
+{
+    for (int i = 0; i < 3; i++)
+        out[i] = clampf(pid_update(&$.pid[i], sp[i], $.gyro_dps[i], LOOP_DT, tpa, i_en), -1.0f, 1.0f);
+}
+
+static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *out)
+{
+    const flght_mode_t fm = (S.rc.fmode_sw == 0) ? FM_RATE : FM_ANGLE;
+    const float thr = $.rc.throttle;
+    flopt sp[3], r[3];
+
+    axes_setpoints(p, fm, $.rc.roll, $.rc.pitch, $.rc.yaw, sp);
+    out->idle_only = thr < 0.03f;
+    rate_loop(sp, tpa_scale(p, thr), thr > 0.10f, r);
+    out->roll = r[0]; out->pitch = r[1]; out->yaw = r[2];
+    out->throttle = p->idle_throttle + thr * (1.0f - p->idle_throttle);
+}
+
+208 yesyes continue :thumbs_up:
