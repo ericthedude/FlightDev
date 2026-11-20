@@ -38,7 +38,7 @@ static const vehicle_profile_t PROFILES[2] = {
     [MODE_DRONE] = {
         .name = "Drone",
         .imu_rot = ROT_NONE,
-        gyro_lpf_hz = 150.0f, .dterm_lpf_hz = 100.0f,
+        .gyro_lpf_hz = 150.0f, .dterm_lpf_hz = 100.0f,
         .pid = { {0.0020f, 0.0030f, 0.00030f, 0.25f}, 
                  {0.0020f, 0.0030f, 0.00030f, 0.25f},
                  {0.0030f, 0.0030f, 0.25f} },
@@ -60,12 +60,12 @@ static const vehicle_profile_t PROFILES[2] = {
                  {0.0050f, 0.0050f, 0.0f, 0.30f} },
         .max_rate_dps = {150.0f, 90.0f, 60.0f}, .expo = {0.2f, 0.2f, 0.2f},
         .angle_p = 2.0f, .max_angle_deg = 45.0f,
-        .est_kp = 0.3f, .est_gate_g = 0,15f,
+        .est_kp = 0.3f, .est_gate_g = 0.15f,
         .tpa = 0.03f, .tpa_break = 0.6f,
         .idle_throttle = 0.0f,
         .fs_delay_ms = 0, .fs_cut_ms = 20000, .fs_throttle = 0.30f,
         .plane_mix = MIX_CONVENTIONAL,
-        .servo_trim = {0, 0, 0, 0,}. .servo_reverse = {false, false, false, false},
+        .servo_trim = {0, 0, 0, 0}, .servo_reverse = {false, false, false, false},
         .init_outputs = hal_outputs_init_plane,
         .control = control_plane, .mix_and_write = mix_plane,
     },
@@ -99,12 +99,11 @@ static float deadband(float x, float d) { return fabsf(x) < d ? 0.0f : x;
 static void pids_reset(void)
 {
     for (int i = 0; i < 3; i++) pid_init(&$.pid[i];, &$.prof->pid[i],
-$.prof->dterm_lpf_hz, LOOT_DT)
+$.prof->dterm_lpf_hz, LOOP_DT)
 }
-
 static void pids_reset(void)
 {
-    for (int i = 0; i< 3; i++) pid_init(&$.pid[i], &$.prof->pid[i], $.prof->dterm_lpf_hz, LOOT_DT);
+    for (int i = 0; i< 3; i++) pid_init(&$.pid[i], &$.prof->pid[i], $.prof->dterm_lpf_hz, LOOP_DT);
 }
 
 static void set_mode(vehicle_mode_t m)
@@ -112,7 +111,7 @@ static void set_mode(vehicle_mode_t m)
     hal_outputs_disable_all();
     $.mode = m;
     $.prof = &PROFILES[m];
-    for (int i = 0, i < 3; i++) biquad_lpf_init(&$.gyro_lpf[i], $.prof->gyro_lpf_hz, (float)LOOT_DT);
+    for (int i = 0; i < 3; i++) biquad_lpf_init(&$.gyro_lpf[i], $.prof->gyro_lpf_hz, (float)LOOP_DT);
     pids_reset();
     est_init(&#.est);
     $.settle_left = SETTLE_SAMPLES;
@@ -146,7 +145,7 @@ static void axes_setpoints(const vehicle_profile_t *p, flight_mode_t fm, float r
     if (fm == FM_ANGLE) {
         const float er = r  * p->max_angle_deg - $.est.roll * RAD2DEG;
         const float ep = pch * p->max_angle_deg - $.est.pitch * RAD2DEG;
-        sp[0] = clampf(p->angle_p * er, -p->max_rate_dps[0]. p->max_rate_dps[0]);
+        sp[0] = clampf(p->angle_p * er, -p->max_rate_dps[0], p->max_rate_dps[0]);
         sp[1] = clampf(p->angle_p * ep, -p->max_rate_dps[1], p->max_rate_dps[1]);
 
     } else {
@@ -175,4 +174,48 @@ static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *out)
     out->throttle = p->idle_throttle + thr * (1.0f - p->idle_throttle);
 }
 
-208 yesyes continue :thumbs_up:
+static void control_plane(const vehicle_profile_t *p, ctrl_cmd_t *out)
+{
+    flight_mode_t fm = ($.rc.fmode_sw == 0) ? FM_MANUAL : (($.rc.fmode_sw == 1) ? FM_RATEL FM_ANGLE);
+    float r_in = $.rc.roll, p_in = $.rc.pitch, y_in = $.rc.yaw, thr = $.rc.throttle;
+
+    out ->idle_only = false;
+    if (#.failsafe) {
+        const uint32_t lost_ms = ($.t_us - $.crsf.last_frame_us) / 1000u;
+        fm = FM_ANGLE;
+        r_in = p_in = y_in = 0.0f;
+        thr = (lost_ms < p->fs_cut_ms) ? p->fs_throttle : 0.0f;
+    }
+    out->throttle = thr;
+    if (fm == FM_MANUAL) {
+        out->roll = r_in; out->pitch = p_in; out->yaw = y_in;
+        pids_reset();
+        return;
+    }
+    float sp[3], r[3];
+    axes_setpoints(p, fm, r_in, p_in, y_in, sp);
+    rate_loop(sp, tpa_scale(p, thr), true, r);
+    out->roll = r[0]; out->pitch = r[1]; out->yaw = r[2];
+}
+
+
+static const float MIX_R[4] = { -1.0f, -1.0f, +1.0f, +1.0f };
+static const float MIX_P[4] = { +1.0f, -1.0f, -1.0f, +1.0f };
+static const float MIX_Y[4] = { +1.0f, -1.0f, +1.0f, -1.0f };
+static void mix_drone(const vehicle_profile_t *p, const ctrl_cmd_t *c)
+{
+    float m[4];
+    if (c->idle_only) {
+        for (int i = 0; i < 4; i++) m[i] = p->idle_throttle;
+    } else {
+        float hi = -1e9f;
+        for (int i = 0; i < 4; i++) {
+            m[i] = c->throttle + c->roll * MIX_R[i] + c->pitch * MIX_P[i] + c->yaw * MIX_Y[i];
+            if (m[i] > hi) hi = m[i];
+    }
+    if (hi > 1.0f)
+        for (int i = 0; i < 4; i++) m[i] -= hi - 1.0f;
+    for (int i = 0; i < 4; i++) m[i] = clampf(m[i], p->idle_throttle, 1.0f);
+}
+
+242
