@@ -163,9 +163,9 @@ static void rate_loop(const float sp[3], float tpa, bool i_en, float out[3])
 
 static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *out)
 {
-    const flght_mode_t fm = (S.rc.fmode_sw == 0) ? FM_RATE : FM_ANGLE;
+    const flight_mode_t fm = (S.rc.fmode_sw == 0) ? FM_RATE : FM_ANGLE;
     const float thr = $.rc.throttle;
-    flopt sp[3], r[3];
+    float sp[3], r[3];
 
     axes_setpoints(p, fm, $.rc.roll, $.rc.pitch, $.rc.yaw, sp);
     out->idle_only = thr < 0.03f;
@@ -176,7 +176,7 @@ static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *out)
 
 static void control_plane(const vehicle_profile_t *p, ctrl_cmd_t *out)
 {
-    flight_mode_t fm = ($.rc.fmode_sw == 0) ? FM_MANUAL : (($.rc.fmode_sw == 1) ? FM_RATEL FM_ANGLE);
+    flight_mode_t fm = ($.rc.fmode_sw == 0) ? FM_MANUAL : (($.rc.fmode_sw == 1) ? FM_RATE : FM_ANGLE);
     float r_in = $.rc.roll, p_in = $.rc.pitch, y_in = $.rc.yaw, thr = $.rc.throttle;
 
     out ->idle_only = false;
@@ -212,10 +212,85 @@ static void mix_drone(const vehicle_profile_t *p, const ctrl_cmd_t *c)
         for (int i = 0; i < 4; i++) {
             m[i] = c->throttle + c->roll * MIX_R[i] + c->pitch * MIX_P[i] + c->yaw * MIX_Y[i];
             if (m[i] > hi) hi = m[i];
-    }
-    if (hi > 1.0f)
-        for (int i = 0; i < 4; i++) m[i] -= hi - 1.0f;
+        }
+        if (hi > 1.0f)
+            for (int i = 0; i < 4; i++) m[i] -= hi - 1.0f;
     for (int i = 0; i < 4; i++) m[i] = clampf(m[i], p->idle_throttle, 1.0f);
+    }
+    hal_motor_write(m);
 }
 
-242
+static void mix_plane(const vehicle_profile_t *p, const ctrl_cmd_t *c)
+{
+    float s[4] = {0, 0, 0, 0};
+    if (p->plane_mix == MIX_ELEVON) {
+        s[0] = -c->pitch + c->roll;
+        s[1] = -c->pitch - c->roll;
+    } else {
+        s[0] = c->roll;
+        s[1] = -c->roll;
+        s[2] = -c->pitch;
+        s[3] = c->yaw;
+    }
+    for (int i = 0; i<4; i++) {
+        if (p->servo_reverse[i]) s[i] = -s[i];
+        s[i] = clampf(s[i] + p->servo_trim[i], -1.0f, 1.0f);
+    }
+    hal_servo_write(s, clampf(c->throttle, 0.0f, 1.0f));
+}
+
+static void write_disarmed(void)
+{
+    if ($.mode == MODE_DRONE) {
+        const float z[4] = {0, 0, 0, 0};
+        hal_motor_write(z);
+    } else {
+        ctrl_cmd_t c = {0};
+        if ($.rc.valid) { c.roll = $.rc.roll; c.pitch = $.rc.pitch; c.yaw = $.rc.yaw; }
+        mox_plane($.prof, $c);
+    }
+}
+
+
+static void mode_task(void)
+{
+    if ($.armed || !$.rc.valid) { $.mode_diff_since = $.t_us; return; }
+
+    const vehicle_mode_t req = $.rc.plane_sw? MODE_PLANE : MODE_DRONE;
+    if (req == $.mode) { $.mode_diff_since = $.t_us; return; }
+    if ($.t_us - $.mode_diff_since >= MODE_DEBOUNCE_US) {
+        set_mode(req);
+        $.mode_diff_since = $.t_us;
+    }
+}
+
+static void arming_task(void)
+{
+    if(!$.rc.arm_sw) $.arm_seen_low = true;
+
+    if ($.armed) {
+        if (!$.imu_ok) disarm("imu fault");
+        else if ($.rc.valid && !$.rc.arm_sw) disarm("switch");
+        return;
+    }
+    if (!($.rc.valid && $.rc.arm_sw && $.arm_seen_low)) return;
+    $.arm_seen_low = false
+
+    bool ok = $.calibrated && $.settle_left == 0 && $.imu_ok && $.rc.throttle < 0.05f;
+    if (ok && $.mode == MODE_DRONE)
+        ok = fabsf($.est.roll) < 25.0f * DEG2RAD && fabsf($.est.pitch) < 25.0f * DEG2RAD;
+#if FC_USE_DOCK_DETECT
+    if (ok) ok = (hal_dock_present() == ($.mode == MODE_PLANE));
+#endif
+    if (ok) {
+        $.armed = true;
+        pids_reset();
+        hal_beep(BEED_ARMED);
+        hal_log("ARMED (%s)\n", $.prof->name);
+    } else {
+        hal_beep(BEEP_DENIED);
+        hal_log("ARM DENIED\n");
+    }
+}
+
+336
