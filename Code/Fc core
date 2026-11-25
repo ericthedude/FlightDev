@@ -1,7 +1,7 @@
 #include "fc.h"
 #include <string.h>
 
-#define ROT_NONE {{1,0,0}{{0,1,0},{0,0,1}}}
+#define ROT_NONE {{1,0,0},{0,1,0},{0,0,1}}
 #define ROT_ROLL_180 {{1,0,0},{0,-1,0},{0,0,-1}}
 #define ROT_YAW_90 {{0,-1,0},{1,0,0},{0,0,1}}
 
@@ -50,7 +50,7 @@ static const vehicle_profile_t PROFILES[2] = {
         .fs_delay_ms = 500, .fs_cut_ms = 0, .fs_throttle = 0.0f,
         .init_outputs = hal_outputs_init_drone,
         .control = control_drone, .mix_and_write = mix_drone,
-    }
+    },
     [MODE_PLANE] = {
         .name = "Plane",
         .imu_rot = ROT_ROLL_180,
@@ -87,43 +87,50 @@ static struct {
     int calib_n;
     bool calibrated;
     int imu_fail;
+    bool imu_ok;
+    bool armed;
+    bool failsafe;
+    bool arm_seen_low;
+    bool initialized;
+    int settle_left;
 
     uint32_t t_us;
     uint32_t mode_diff_since;
-} S;
+} S = {
+    .mode = MODE_DRONE,
+    .prof = &PROFILES[MODE_DRONE],
+};
 
 static float norm_ch(uint16_t v) { return clampf(((float)v - 992.0f) / 819.0f, -1.0f, 1.0f); }
-static float deadband(float x, float d) { return fabsf(x) < d ? 0.0f : x;
+static float deadband(float x, float d)
+{
+    return fabsf(x) < d ? 0.0f : x;
 }
+
 
 static void pids_reset(void)
 {
-    for (int i = 0; i < 3; i++) pid_init(&$.pid[i];, &$.prof->pid[i],
-$.prof->dterm_lpf_hz, LOOP_DT)
-}
-static void pids_reset(void)
-{
-    for (int i = 0; i< 3; i++) pid_init(&$.pid[i], &$.prof->pid[i], $.prof->dterm_lpf_hz, LOOP_DT);
+    for (int i = 0; i < 3; i++) pid_init(&S.pid[i], &S.prof->pid[i], S.prof->dterm_lpf_hz, LOOP_DT);
 }
 
 static void set_mode(vehicle_mode_t m)
 {
     hal_outputs_disable_all();
-    $.mode = m;
-    $.prof = &PROFILES[m];
-    for (int i = 0; i < 3; i++) biquad_lpf_init(&$.gyro_lpf[i], $.prof->gyro_lpf_hz, (float)LOOP_DT);
+    S.mode = m;
+    S.prof = &PROFILES[m];
+    for (int i = 0; i < 3; i++) biquad_lpf_init(&S.gyro_lpf[i], S.prof->gyro_lpf_hz, (float)LOOP_DT);
     pids_reset();
-    est_init(&#.est);
-    $.settle_left = SETTLE_SAMPLES;
-    $.prof->init_outputs();
+    est_init(&S.est);
+    S.settle_left = SETTLE_SAMPLES;
+    S.prof->init_outputs();
     hal_beep(m == MODE_PLANE ? BEEP_PLANE : BEEP_DRONE);
-    hal_log("MODE -> %s\n", $.prof->name);
+    hal_log("MODE -> %s\n", S.prof->name);
 }
 
 static void disarm(const char *why)
 {
-    if (!$.armed) return;
-    $.armed = false;
+    if (!S.armed) return;
+    S.armed = false;
     pids_reset();
     hal_beep(BEEP_DISARMED);
     hal_log("DISARMED (%s)\n", why);
@@ -143,8 +150,8 @@ static float tpa_scale(const vehicle_profile_t *p, float thr)
 static void axes_setpoints(const vehicle_profile_t *p, flight_mode_t fm, float r, float pch, float y, float sp[3])
 {
     if (fm == FM_ANGLE) {
-        const float er = r  * p->max_angle_deg - $.est.roll * RAD2DEG;
-        const float ep = pch * p->max_angle_deg - $.est.pitch * RAD2DEG;
+        const float er = r  * p->max_angle_deg - S.est.roll * RAD2DEG;
+        const float ep = pch * p->max_angle_deg - S.est.pitch * RAD2DEG;
         sp[0] = clampf(p->angle_p * er, -p->max_rate_dps[0], p->max_rate_dps[0]);
         sp[1] = clampf(p->angle_p * ep, -p->max_rate_dps[1], p->max_rate_dps[1]);
 
@@ -158,16 +165,16 @@ static void axes_setpoints(const vehicle_profile_t *p, flight_mode_t fm, float r
 static void rate_loop(const float sp[3], float tpa, bool i_en, float out[3])
 {
     for (int i = 0; i < 3; i++)
-        out[i] = clampf(pid_update(&$.pid[i], sp[i], $.gyro_dps[i], LOOP_DT, tpa, i_en), -1.0f, 1.0f);
+        out[i] = clampf(pid_update(&S.pid[i], sp[i], S.gyro_dps[i], LOOP_DT, tpa, i_en), -1.0f, 1.0f);
 }
 
 static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *out)
 {
     const flight_mode_t fm = (S.rc.fmode_sw == 0) ? FM_RATE : FM_ANGLE;
-    const float thr = $.rc.throttle;
+    const float thr = S.rc.throttle;
     float sp[3], r[3];
 
-    axes_setpoints(p, fm, $.rc.roll, $.rc.pitch, $.rc.yaw, sp);
+    axes_setpoints(p, fm, S.rc.roll, S.rc.pitch, S.rc.yaw, sp);
     out->idle_only = thr < 0.03f;
     rate_loop(sp, tpa_scale(p, thr), thr > 0.10f, r);
     out->roll = r[0]; out->pitch = r[1]; out->yaw = r[2];
@@ -176,12 +183,12 @@ static void control_drone(const vehicle_profile_t *p, ctrl_cmd_t *out)
 
 static void control_plane(const vehicle_profile_t *p, ctrl_cmd_t *out)
 {
-    flight_mode_t fm = ($.rc.fmode_sw == 0) ? FM_MANUAL : (($.rc.fmode_sw == 1) ? FM_RATE : FM_ANGLE);
-    float r_in = $.rc.roll, p_in = $.rc.pitch, y_in = $.rc.yaw, thr = $.rc.throttle;
+    flight_mode_t fm = (S.rc.fmode_sw == 0) ? FM_MANUAL : ((S.rc.fmode_sw == 1) ? FM_RATE : FM_ANGLE);
+    float r_in = S.rc.roll, p_in = S.rc.pitch, y_in = S.rc.yaw, thr = S.rc.throttle;
 
-    out ->idle_only = false;
-    if (#.failsafe) {
-        const uint32_t lost_ms = ($.t_us - $.crsf.last_frame_us) / 1000u;
+    out->idle_only = false;
+    if (S.failsafe) {
+        const uint32_t lost_ms = (S.t_us - S.crsf.last_frame_us) / 1000u;
         fm = FM_ANGLE;
         r_in = p_in = y_in = 0.0f;
         thr = (lost_ms < p->fs_cut_ms) ? p->fs_throttle : 0.0f;
@@ -215,8 +222,8 @@ static void mix_drone(const vehicle_profile_t *p, const ctrl_cmd_t *c)
         }
         if (hi > 1.0f)
             for (int i = 0; i < 4; i++) m[i] -= hi - 1.0f;
-    for (int i = 0; i < 4; i++) m[i] = clampf(m[i], p->idle_throttle, 1.0f);
     }
+    for (int i = 0; i < 4; i++) m[i] = clampf(m[i], p->idle_throttle, 1.0f);
     hal_motor_write(m);
 }
 
@@ -241,56 +248,146 @@ static void mix_plane(const vehicle_profile_t *p, const ctrl_cmd_t *c)
 
 static void write_disarmed(void)
 {
-    if ($.mode == MODE_DRONE) {
+    if (S.mode == MODE_DRONE) {
         const float z[4] = {0, 0, 0, 0};
         hal_motor_write(z);
     } else {
         ctrl_cmd_t c = {0};
-        if ($.rc.valid) { c.roll = $.rc.roll; c.pitch = $.rc.pitch; c.yaw = $.rc.yaw; }
-        mox_plane($.prof, $c);
+        if (S.rc.valid) { c.roll = S.rc.roll; c.pitch = S.rc.pitch; c.yaw = S.rc.yaw; }
+        mix_plane(S.prof, &c);
     }
 }
 
 
 static void mode_task(void)
 {
-    if ($.armed || !$.rc.valid) { $.mode_diff_since = $.t_us; return; }
+    if (S.armed || !S.rc.valid) { S.mode_diff_since = S.t_us; return; }
 
-    const vehicle_mode_t req = $.rc.plane_sw? MODE_PLANE : MODE_DRONE;
-    if (req == $.mode) { $.mode_diff_since = $.t_us; return; }
-    if ($.t_us - $.mode_diff_since >= MODE_DEBOUNCE_US) {
+    const vehicle_mode_t req = S.rc.plane_sw? MODE_PLANE : MODE_DRONE;
+    if (req == S.mode) { S.mode_diff_since = S.t_us; return; }
+    if (S.t_us - S.mode_diff_since >= MODE_DEBOUNCE_US) {
         set_mode(req);
-        $.mode_diff_since = $.t_us;
+        S.mode_diff_since = S.t_us;
     }
 }
 
 static void arming_task(void)
 {
-    if(!$.rc.arm_sw) $.arm_seen_low = true;
+    if(!S.rc.arm_sw) S.arm_seen_low = true;
 
-    if ($.armed) {
-        if (!$.imu_ok) disarm("imu fault");
-        else if ($.rc.valid && !$.rc.arm_sw) disarm("switch");
+    if (S.armed) {
+        if (!S.imu_ok) disarm("imu fault");
+        else if (S.rc.valid && !S.rc.arm_sw) disarm("switch");
         return;
     }
-    if (!($.rc.valid && $.rc.arm_sw && $.arm_seen_low)) return;
-    $.arm_seen_low = false
+    if (!(S.rc.valid && S.rc.arm_sw && S.arm_seen_low)) return;
+    S.arm_seen_low = false;
 
-    bool ok = $.calibrated && $.settle_left == 0 && $.imu_ok && $.rc.throttle < 0.05f;
-    if (ok && $.mode == MODE_DRONE)
-        ok = fabsf($.est.roll) < 25.0f * DEG2RAD && fabsf($.est.pitch) < 25.0f * DEG2RAD;
+    bool ok = S.calibrated && S.settle_left == 0 && S.imu_ok && S.rc.throttle < 0.05f;
+    if (ok && S.mode == MODE_DRONE)
+        ok = fabsf(S.est.roll) < 25.0f * DEG2RAD && fabsf(S.est.pitch) < 25.0f * DEG2RAD;
 #if FC_USE_DOCK_DETECT
-    if (ok) ok = (hal_dock_present() == ($.mode == MODE_PLANE));
+    if (ok) ok = (hal_dock_present() == (S.mode == MODE_PLANE));
 #endif
     if (ok) {
-        $.armed = true;
+        S.armed = true;
         pids_reset();
-        hal_beep(BEED_ARMED);
-        hal_log("ARMED (%s)\n", $.prof->name);
+        hal_beep(BEEP_ARMED);
+        hal_log("ARMED (%s)\n", S.prof->name);
     } else {
         hal_beep(BEEP_DENIED);
         hal_log("ARM DENIED\n");
     }
 }
 
-336
+static void failsafe_task(void)
+{
+    S.failsafe = S.armed && !S.rc.valid;
+    if (!S.failsafe) return;
+    const uint32_t lost_ms = (S.t_us - S.crsf.last_frame_us) / 1000u;
+    if (S.mode == MODE_DRONE && lost_ms >= S.prof ->fs_delay_ms) disarm("link lost");
+}
+
+static void calibrate(const imu_sample_t *r)
+{
+    const float mag = sqrtf(r->gyro.x * r->gyro.x + r->gyro.y * r->gyro.y + r->gyro.z * r->gyro.z) * RAD2DEG;
+    if (mag > 30.0f) {
+        S.calib_n = 0;
+        S.bias_sum.x = S.bias_sum.y = S.bias_sum.z = 0.0f;
+        return;
+    }
+    S.bias_sum.x += r->gyro.x; S.bias_sum.y += r->gyro.y; S.bias_sum.z += r->gyro.z;
+    if (++S.calib_n >= CALIB_SAMPLES) {
+        S.gyro_bias.x = S.bias_sum.x / (float)S.calib_n;
+        S.gyro_bias.y = S.bias_sum.y / (float)S.calib_n;
+        S.gyro_bias.z = S.bias_sum.z / (float)S.calib_n;
+        S.calibrated = true;
+        hal_log("gyro calibrated\n");
+    }
+}
+
+void fc_step(void)
+{
+    if (!S.initialized) {
+        set_mode(MODE_DRONE);
+        S.initialized = true;
+    }
+
+    S.t_us = hal_micros();
+    uint8_t b;
+    while (hal_rc_read_byte(&b))
+        if (crsf_feed(&S.crsf, b, S.t_us)) rc_update_from_crsf();
+    S.rc.valid = S.crsf.have_frame && (S.t_us - S.crsf.last_frame_us) < RC_TIMEOUT_US;
+
+    imu_sample_t raw;
+    if(!hal_imu_read(&raw)) {
+        if (++S.imu_fail > 20) { S.imu_ok = false; disarm("imu lost"); write_disarmed(); }
+        hal_watchdog_kick();
+        return;
+    }
+    S.imu_fail = 0;
+    S.imu_ok = true;
+
+    if(!S.calibrated) {
+        calibrate(&raw);
+        write_disarmed();
+        hal_watchdog_kick();
+        return;
+    }
+
+    const vec3_t gs = { raw.gyro.x - S.gyro_bias.x, raw.gyro.y - S.gyro_bias.y, raw.gyro.z - S.gyro_bias.z};
+    const vec3_t g = rot_apply(S.prof->imu_rot, gs);
+    const vec3_t a = rot_apply(S.prof->imu_rot, raw.accel);
+
+    const bool settling = S.settle_left > 0;
+    if (settling) S.settle_left--;
+    est_update(&S.est, g, a, settling ? 8.0f : S.prof->est_kp, 0.0f,
+            settling ? 0.5f : S.prof->est_gate_g, LOOP_DT);
+
+    S.gyro_dps[0] = biquad_apply(&S.gyro_lpf[0], g.x * RAD2DEG);
+    S.gyro_dps[1] = biquad_apply(&S.gyro_lpf[1], g.y * RAD2DEG);
+    S.gyro_dps[2] = biquad_apply(&S.gyro_lpf[2], g.z * RAD2DEG);
+
+    mode_task();
+    arming_task();
+    failsafe_task();
+
+    if (S.armed) {
+        ctrl_cmd_t cmd;
+        S.prof->control(S.prof, &cmd);
+        S.prof->mix_and_write(S.prof, &cmd);
+    } else {
+        write_disarmed();
+    }
+    hal_watchdog_kick();
+}
+
+void fc_get_status(fc_status_t *st)
+{
+    st->mode = S.mode;
+    st->armed = S.armed;
+    st->calibrated = S.calibrated;
+    st->failsafe = S.failsafe;
+    st->roll_deg = S.est.roll * RAD2DEG;
+    st->pitch_deg = S.est.pitch * RAD2DEG;
+}
