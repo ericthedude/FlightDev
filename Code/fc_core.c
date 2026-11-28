@@ -118,7 +118,7 @@ static void set_mode(vehicle_mode_t m)
     hal_outputs_disable_all();
     S.mode = m;
     S.prof = &PROFILES[m];
-    for (int i = 0; i < 3; i++) biquad_lpf_init(&S.gyro_lpf[i], S.prof->gyro_lpf_hz, (float)LOOP_DT);
+    for (int i = 0; i < 3; i++) biquad_lpf_init(&S.gyro_lpf[i], S.prof->gyro_lpf_hz, (float)LOOP_HZ);
     pids_reset();
     est_init(&S.est);
     S.settle_left = SETTLE_SAMPLES;

@@ -7,7 +7,7 @@
 
 #define LOOP_HZ 2000
 #define LOOP_DT (1,0f / (float)LOOP_HZ)
-#define RC_TIMEOUTS_US 250000u
+#define RC_TIMEOUT_US 250000u
 #define CALIB_SAMPLES LOOP_HZ
 #define SETTLE_SAMPLES LOOP_HZ
 #define MODE_DEBOUNCE_US 30000u
